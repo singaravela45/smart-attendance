@@ -14,19 +14,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-# ==========================================
-# PATHS (independent of the working directory)
-# ==========================================
-
 BASE_DIR = Path(__file__).resolve().parent
 
-
-# ==========================================
-# LOAD ENVIRONMENT VARIABLES
-# ==========================================
-
 def load_env_file(env_path):
-    """Load KEY=VALUE lines from a .env file without overriding real env vars."""
     if not env_path.is_file():
         return
 
@@ -63,11 +53,6 @@ def env_float(name, default):
 
 
 load_env_file(BASE_DIR / ".env")
-
-
-# ==========================================
-# CONFIGURATION
-# ==========================================
 
 SENDER_EMAIL = os.getenv("SENDER_EMAIL", "")
 SENDER_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")
@@ -127,11 +112,6 @@ face_detector = cv2.CascadeClassifier(str(CASCADE_PATH))
 if face_detector.empty():
     raise RuntimeError(f"Could not load Haar Cascade model: {CASCADE_PATH}")
 
-
-# ==========================================
-# FACE PREPROCESSING / DETECTION
-# ==========================================
-
 def preprocess_face(face):
     face = cv2.resize(face, (FACE_WIDTH, FACE_HEIGHT))
     face = cv2.equalizeHist(face)
@@ -158,10 +138,6 @@ def detect_largest_face(gray_image):
     x, y, w, h = max(faces, key=lambda face: face[2] * face[3])
     return x, y, w, h
 
-
-# ==========================================
-# LOAD AND TRAIN KNOWN FACES
-# ==========================================
 
 def load_known_faces():
     training_faces = []
