@@ -1,0 +1,15 @@
+[Unit]
+Description=Face Recognition Attendance System
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/root/files
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /home/root/files/main.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
