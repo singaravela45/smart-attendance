@@ -1,20 +1,31 @@
+
 #!/usr/bin/env python3
 """Smart attendance system: face recognition, CSV attendance, email alerts."""
+
 import csv
 import os
+import re
 import signal
 import smtplib
 import sys
 import threading
 import time
+
 from datetime import date, datetime
 from email.message import EmailMessage
+from email.utils import parseaddr
 from pathlib import Path
 
 import cv2
 import numpy as np
 
+
 BASE_DIR = Path(__file__).resolve().parent
+
+
+# ==========================================
+# ENVIRONMENT CONFIGURATION
+# ==========================================
 
 def load_env_file(env_path):
     if not env_path.is_file():
@@ -54,9 +65,11 @@ def env_float(name, default):
 
 load_env_file(BASE_DIR / ".env")
 
-SENDER_EMAIL = os.getenv("SENDER_EMAIL", "")
-SENDER_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")
-RECEIVER_EMAIL = os.getenv("RECEIVER_EMAIL", "")
+
+SENDER_EMAIL = os.getenv("SENDER_EMAIL", "").strip()
+SENDER_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "").strip()
+RECEIVER_EMAIL = os.getenv("RECEIVER_EMAIL", "").strip()
+
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 
@@ -64,37 +77,128 @@ KNOWN_FACES_DIR = BASE_DIR / "known_faces"
 ATTENDANCE_FILE = BASE_DIR / "attendance.csv"
 CASCADE_PATH = BASE_DIR / "models" / "haarcascade_frontalface_default.xml"
 
-# Camera index (your camera is 1; override with CAMERA_INDEX in .env if needed).
-CAMERA_INDEX = env_int("CAMERA_INDEX", 1)
 
-# LBPH confidence: LOWER means a better match. Calibrate with real data.
-FACE_CONFIDENCE_THRESHOLD = env_float("FACE_CONFIDENCE_THRESHOLD", 70)
+# Camera configuration:
+# auto = test camera 0 and then camera 1.
+# 0 or 1 = manually select a camera.
+# 0,1 = manually specify camera priority.
 
-# Seconds between alert emails.
-COOLDOWN_SECONDS = env_int("COOLDOWN_SECONDS", 30)
+CAMERA_SETTING = os.getenv("CAMERA_INDEX", "auto").strip().lower()
 
-# An unknown face must appear in this many consecutive frames before alerting.
-UNKNOWN_FRAMES_REQUIRED = env_int("UNKNOWN_FRAMES_REQUIRED", 5)
+
+# Face recognition.
+FACE_CONFIDENCE_THRESHOLD = env_float(
+    "FACE_CONFIDENCE_THRESHOLD", 70
+)
+
+# Unknown face detection.
+UNKNOWN_FRAMES_REQUIRED = env_int(
+    "UNKNOWN_FRAMES_REQUIRED", 5
+)
+
+UNKNOWN_CLEAR_FRAMES_REQUIRED = env_int(
+    "UNKNOWN_CLEAR_FRAMES_REQUIRED", 15
+)
+
+# Global cooldown between all unauthorized-person email alerts.
+ALERT_COOLDOWN_SECONDS = 600  # 10 minutes
+
+# Logging intervals.
+RECOGNIZED_LOG_INTERVAL = 10
+UNKNOWN_LOG_INTERVAL = 5
+
+# Camera recovery.
+MAX_READ_FAILURES = 10
+MAX_CAMERA_RETRIES = 5
+CAMERA_RETRY_DELAY = 2.0
+
+# Attendance retry.
+ATTENDANCE_RETRY_SECONDS = 10
 
 FACE_WIDTH = 200
 FACE_HEIGHT = 200
 
-# Detection runs on a downscaled frame for speed; recognition uses full-res crops.
 DETECT_SCALE = 0.5
 
-# Camera recovery.
-MAX_READ_FAILURES = 10        # consecutive bad reads before reopening the camera
-MAX_CAMERA_RETRIES = 5        # reopen attempts before exiting (systemd can restart)
-CAMERA_RETRY_DELAY = 2.0      # seconds between reopen attempts
-
-# Logging / retry throttles.
-RECOGNIZED_LOG_INTERVAL = 10  # seconds between "[RECOGNIZED]" lines per person
-ATTENDANCE_RETRY_SECONDS = 10 # wait before retrying a failed attendance write
-
-# mark_attendance() results
 ATTENDANCE_MARKED = "marked"
 ATTENDANCE_ALREADY = "already"
 ATTENDANCE_ERROR = "error"
+
+
+# ==========================================
+# EMAIL VALIDATION
+# ==========================================
+
+def valid_email_address(address):
+    if not address:
+        return False
+
+    _, parsed_address = parseaddr(address)
+
+    if parsed_address != address:
+        return False
+
+    return bool(re.fullmatch(
+        r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+        r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+",
+        address
+    ))
+
+
+def email_configured():
+    placeholders = {
+        "your mail id",
+        "your email",
+        "your_email@gmail.com",
+        "your app password",
+        "your password",
+        "your receiver email"
+    }
+
+    if not valid_email_address(SENDER_EMAIL):
+        return False
+
+    if not valid_email_address(RECEIVER_EMAIL):
+        return False
+
+    if not SENDER_PASSWORD:
+        return False
+
+    if SENDER_EMAIL.lower() in placeholders:
+        return False
+
+    if RECEIVER_EMAIL.lower() in placeholders:
+        return False
+
+    if SENDER_PASSWORD.lower() in placeholders:
+        return False
+
+    return True
+
+
+def validate_email_configuration():
+    if not SENDER_EMAIL or not RECEIVER_EMAIL:
+        print("[WARNING] Email addresses are missing.")
+        return False
+
+    if not valid_email_address(SENDER_EMAIL):
+        print("[WARNING] Invalid SENDER_EMAIL format.")
+        return False
+
+    if not valid_email_address(RECEIVER_EMAIL):
+        print("[WARNING] Invalid RECEIVER_EMAIL format.")
+        return False
+
+    if not SENDER_PASSWORD:
+        print("[WARNING] Gmail app password is missing.")
+        return False
+
+    if not email_configured():
+        print("[WARNING] Placeholder email settings detected.")
+        return False
+
+    print("[INFO] Email configuration validated.")
+    return True
 
 
 # ==========================================
@@ -103,14 +207,19 @@ ATTENDANCE_ERROR = "error"
 
 if not hasattr(cv2, "face"):
     raise RuntimeError(
-        "cv2.face is not available. OpenCV was built without the contrib "
-        "modules. In Yocto, enable the 'contrib' PACKAGECONFIG for opencv."
+        "cv2.face is not available. OpenCV was built without "
+        "the contrib modules. Enable the contrib PACKAGECONFIG "
+        "for OpenCV in Yocto."
     )
+
 
 face_detector = cv2.CascadeClassifier(str(CASCADE_PATH))
 
 if face_detector.empty():
-    raise RuntimeError(f"Could not load Haar Cascade model: {CASCADE_PATH}")
+    raise RuntimeError(
+        f"Could not load Haar Cascade model: {CASCADE_PATH}"
+    )
+
 
 def preprocess_face(face):
     face = cv2.resize(face, (FACE_WIDTH, FACE_HEIGHT))
@@ -125,6 +234,7 @@ def detect_faces(gray_image, min_size):
         minNeighbors=5,
         minSize=min_size
     )
+
     return list(faces)
 
 
@@ -134,10 +244,17 @@ def detect_largest_face(gray_image):
     if not faces:
         return None
 
-    # Select the largest detected face.
-    x, y, w, h = max(faces, key=lambda face: face[2] * face[3])
+    x, y, w, h = max(
+        faces,
+        key=lambda face: face[2] * face[3]
+    )
+
     return x, y, w, h
 
+
+# ==========================================
+# LOAD AND TRAIN KNOWN FACES
+# ==========================================
 
 def load_known_faces():
     training_faces = []
@@ -145,18 +262,24 @@ def load_known_faces():
     label_to_name = {}
 
     if not KNOWN_FACES_DIR.is_dir():
-        print(f"[ERROR] known_faces directory not found: {KNOWN_FACES_DIR}")
+        print(
+            f"[ERROR] known_faces directory not found: "
+            f"{KNOWN_FACES_DIR}"
+        )
         return None, {}
 
     current_label = 0
 
     for path in sorted(KNOWN_FACES_DIR.iterdir()):
 
-        if path.suffix.lower() not in (".jpg", ".jpeg", ".png"):
+        if path.suffix.lower() not in (
+            ".jpg", ".jpeg", ".png"
+        ):
             continue
 
         try:
-            # john_1.jpg and john_2.jpg -> John
+            # john_1.jpg, john_2.jpg -> John
+
             name_part = path.stem
             parts = name_part.rsplit("_", 1)
 
@@ -171,17 +294,24 @@ def load_known_faces():
                 print(f"[WARNING] Cannot read {path.name}")
                 continue
 
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            gray = cv2.cvtColor(
+                image, cv2.COLOR_BGR2GRAY
+            )
+
             face_location = detect_largest_face(gray)
 
             if face_location is None:
-                print(f"[WARNING] No face found in {path.name}")
+                print(
+                    f"[WARNING] No face found in {path.name}"
+                )
                 continue
 
             x, y, w, h = face_location
-            face = preprocess_face(gray[y:y + h, x:x + w])
 
-            # One label per person.
+            face = preprocess_face(
+                gray[y:y + h, x:x + w]
+            )
+
             if name not in label_to_name:
                 label_to_name[name] = current_label
                 current_label += 1
@@ -189,13 +319,22 @@ def load_known_faces():
             training_faces.append(face)
             training_labels.append(label_to_name[name])
 
-            print(f"[INFO] Loaded {path.name} -> {name}")
+            print(
+                f"[INFO] Loaded {path.name} -> {name}"
+            )
 
         except Exception as e:
-            print(f"[ERROR] Failed to load {path.name}: {e}")
+            print(
+                f"[ERROR] Failed to load {path.name}: {e}"
+            )
 
     if not training_faces:
         return None, {}
+
+    print(
+        f"[INFO] Training with {len(training_faces)} images "
+        f"for {len(label_to_name)} people."
+    )
 
     recognizer = cv2.face.LBPHFaceRecognizer_create(
         radius=1,
@@ -211,25 +350,33 @@ def load_known_faces():
 
     print("[INFO] Face training completed.")
 
-    return recognizer, {label: name for name, label in label_to_name.items()}
+    return recognizer, {
+        label: name
+        for name, label in label_to_name.items()
+    }
 
 
 # ==========================================
-# ATTENDANCE
+# ATTENDANCE MANAGEMENT
 # ==========================================
 
 def mark_attendance(name):
-    """Return ATTENDANCE_MARKED, ATTENDANCE_ALREADY, or ATTENDANCE_ERROR."""
-
     today = date.today().isoformat()
 
     if ATTENDANCE_FILE.exists():
         try:
             with open(
-                ATTENDANCE_FILE, "r", newline="", encoding="utf-8"
+                ATTENDANCE_FILE,
+                "r",
+                newline="",
+                encoding="utf-8"
             ) as file:
+
                 for row in csv.DictReader(file):
-                    if row.get("Name") == name and row.get("Date") == today:
+                    if (
+                        row.get("Name") == name
+                        and row.get("Date") == today
+                    ):
                         return ATTENDANCE_ALREADY
 
         except (OSError, csv.Error) as e:
@@ -245,16 +392,31 @@ def mark_attendance(name):
 
     try:
         with open(
-            ATTENDANCE_FILE, "a", newline="", encoding="utf-8"
+            ATTENDANCE_FILE,
+            "a",
+            newline="",
+            encoding="utf-8"
         ) as file:
+
             writer = csv.writer(file)
 
             if write_header:
-                writer.writerow(["Name", "Date", "Time", "Status"])
+                writer.writerow([
+                    "Name", "Date", "Time", "Status"
+                ])
 
-            writer.writerow([name, today, current_time, "Present"])
+            writer.writerow([
+                name,
+                today,
+                current_time,
+                "Present"
+            ])
 
-        print(f"[ATTENDANCE] {name} marked present at {current_time}")
+        print(
+            f"[ATTENDANCE] {name} marked present "
+            f"at {current_time}"
+        )
+
         return ATTENDANCE_MARKED
 
     except OSError as e:
@@ -266,38 +428,43 @@ def mark_attendance(name):
 # EMAIL ALERT
 # ==========================================
 
-def email_configured():
-    return bool(SENDER_EMAIL and SENDER_PASSWORD and RECEIVER_EMAIL)
-
-
 def send_email_alert(image_frame):
-    """Send the alert email. Runs in a background thread."""
+    """Send an email alert in a background thread."""
 
     if not email_configured():
         print(
-            "[ERROR] Email not configured "
-            "(SENDER_EMAIL, GMAIL_APP_PASSWORD, RECEIVER_EMAIL)."
+            "[ERROR] Email not configured. "
+            "Please check your .env file."
         )
         return False
 
     try:
-        success, encoded_image = cv2.imencode(".jpg", image_frame)
+        success, encoded_image = cv2.imencode(
+            ".jpg", image_frame
+        )
 
         if not success:
             print("[ERROR] Could not encode alert image.")
             return False
 
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        timestamp = datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
 
         msg = EmailMessage()
+
         msg["From"] = SENDER_EMAIL
         msg["To"] = RECEIVER_EMAIL
-        msg["Subject"] = "ALERT: Unauthorized Person Detected!"
+        msg["Subject"] = (
+            "ALERT: Unauthorized Person Detected!"
+        )
+
         msg.set_content(
             "An unknown face was detected.\n\n"
             f"Detection time: {timestamp}\n"
             "Captured image is attached."
         )
+
         msg.add_attachment(
             encoded_image.tobytes(),
             maintype="image",
@@ -305,11 +472,21 @@ def send_email_alert(image_frame):
             filename="unauthorized_detected.jpg"
         )
 
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=20) as server:
+        with smtplib.SMTP(
+            SMTP_SERVER,
+            SMTP_PORT,
+            timeout=20
+        ) as server:
+
             server.ehlo()
             server.starttls()
             server.ehlo()
-            server.login(SENDER_EMAIL, SENDER_PASSWORD)
+
+            server.login(
+                SENDER_EMAIL,
+                SENDER_PASSWORD
+            )
+
             server.send_message(msg)
 
         print("[SUCCESS] Alert email sent.")
@@ -321,32 +498,85 @@ def send_email_alert(image_frame):
 
 
 def start_alert_thread(frame):
-    """Send the email in the background so the camera loop never blocks."""
     thread = threading.Thread(
         target=send_email_alert,
         args=(frame.copy(),),
         daemon=True
     )
+
     thread.start()
     return thread
 
 
 # ==========================================
-# CAMERA
+# CAMERA MANAGEMENT
 # ==========================================
 
+def get_camera_indices():
+    """
+    auto -> [0, 1]
+    0    -> [0]
+    1    -> [1]
+    0,1  -> [0, 1]
+    """
+
+    if CAMERA_SETTING == "auto":
+        return [0, 1]
+
+    try:
+        indices = [
+            int(value.strip())
+            for value in CAMERA_SETTING.split(",")
+        ]
+
+        if not indices or any(index < 0 for index in indices):
+            raise ValueError
+
+        return list(dict.fromkeys(indices))
+
+    except ValueError:
+        print(
+            "[WARNING] Invalid CAMERA_INDEX setting. "
+            "Using automatic camera detection."
+        )
+        return [0, 1]
+
+
 def open_camera():
-    capture = cv2.VideoCapture(CAMERA_INDEX)
+    """Try available camera indexes and return the first working camera."""
 
-    if capture.isOpened():
-        return capture
+    for index in get_camera_indices():
 
-    capture.release()
-    return None
+        print(f"[INFO] Trying camera index {index}...")
+
+        capture = cv2.VideoCapture(index)
+
+        if not capture.isOpened():
+            capture.release()
+            print(
+                f"[WARNING] Camera {index} could not be opened."
+            )
+            continue
+
+        ret, frame = capture.read()
+
+        if ret and frame is not None and frame.size > 0:
+            print(
+                f"[SUCCESS] Camera {index} is active."
+            )
+            return capture, index
+
+        print(
+            f"[WARNING] Camera {index} opened "
+            "but cannot provide frames."
+        )
+
+        capture.release()
+
+    return None, None
 
 
 def handle_sigterm(signum, frame):
-    # Lets `systemctl stop` shut down cleanly through the same path as Ctrl+C.
     raise KeyboardInterrupt
 
 
@@ -355,6 +585,7 @@ def handle_sigterm(signum, frame):
 # ==========================================
 
 def main():
+
     recognizer, label_to_name = load_known_faces()
 
     if recognizer is None:
@@ -363,58 +594,95 @@ def main():
 
     signal.signal(signal.SIGTERM, handle_sigterm)
 
-    if not email_configured():
-        print("[WARNING] Email is not fully configured; alerts will only be logged.")
+    validate_email_configuration()
 
     capture = None
+    active_camera_index = None
+
     read_failures = 0
     reopen_failures = 0
 
-    last_alert_time = 0.0
     alert_thread = None
+
     unknown_streak = 0
+    unknown_clear_streak = 0
 
-    attendance_done = {}      # name -> date already handled
-    attendance_retry_at = {}  # name -> time.time() after which to retry
-    last_logged = {}          # name -> last "[RECOGNIZED]" log time
+    # One alert per unknown-person visit.
+    unknown_visit_alerted = False
 
-    print(f"[INFO] Smart Attendance System started (camera index {CAMERA_INDEX}).")
+    # Global cooldown shared by every unknown person.
+    # 0 means an alert can be sent immediately at startup.
+    last_alert_time = 0.0
+
+    attendance_done = {}
+    attendance_retry_at = {}
+    last_logged = {}
+
+    last_unknown_log = 0.0
+
+    print("[INFO] Smart Attendance System started.")
+    print("[INFO] Camera auto-detection enabled.")
+    print("[INFO] Global alert cooldown: 10 minutes.")
     print("[INFO] Running in headless mode.")
     print("[INFO] Press Ctrl+C to stop.")
 
     try:
+
         while True:
 
-            # ---- Camera (re)connection ----
+            # ----------------------------------
+            # CAMERA CONNECTION / RECONNECTION
+            # ----------------------------------
+
             if capture is None:
-                capture = open_camera()
+
+                capture, active_camera_index = open_camera()
 
                 if capture is None:
+
                     reopen_failures += 1
 
                     if reopen_failures >= MAX_CAMERA_RETRIES:
-                        print("[ERROR] Could not open camera. Exiting.")
+                        print(
+                            "[ERROR] No working camera found. "
+                            "Exiting."
+                        )
                         return 1
 
                     print(
                         f"[WARNING] Camera unavailable "
-                        f"({reopen_failures}/{MAX_CAMERA_RETRIES}); retrying..."
+                        f"({reopen_failures}/"
+                        f"{MAX_CAMERA_RETRIES}). Retrying..."
                     )
+
                     time.sleep(CAMERA_RETRY_DELAY)
                     continue
 
                 reopen_failures = 0
                 read_failures = 0
 
+                print(
+                    f"[INFO] Using camera "
+                    f"index {active_camera_index}."
+                )
+
             ret, frame = capture.read()
 
-            if not ret:
+            if not ret or frame is None:
+
                 read_failures += 1
 
                 if read_failures >= MAX_READ_FAILURES:
-                    print("[ERROR] Camera frames unavailable; reopening camera.")
+
+                    print(
+                        "[ERROR] Camera frames unavailable. "
+                        "Reopening camera."
+                    )
+
                     capture.release()
                     capture = None
+                    active_camera_index = None
+
                 else:
                     time.sleep(0.1)
 
@@ -422,27 +690,58 @@ def main():
 
             read_failures = 0
 
-            # ---- Detection on a small frame, recognition on full-res crops ----
-            gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            # ----------------------------------
+            # FACE DETECTION
+            # ----------------------------------
+
+            gray_full = cv2.cvtColor(
+                frame,
+                cv2.COLOR_BGR2GRAY
+            )
+
             frame_h, frame_w = gray_full.shape[:2]
 
             gray_small = cv2.resize(
-                gray_full, None, fx=DETECT_SCALE, fy=DETECT_SCALE
+                gray_full,
+                None,
+                fx=DETECT_SCALE,
+                fy=DETECT_SCALE
             )
 
-            detected_faces = detect_faces(gray_small, (40, 40))
+            detected_faces = detect_faces(
+                gray_small,
+                (40, 40)
+            )
 
             now = time.time()
             today = date.today()
+
             unknown_in_frame = False
+            unknown_confidences = []
+
+            # ----------------------------------
+            # FACE RECOGNITION
+            # ----------------------------------
 
             for (x, y, w, h) in detected_faces:
 
-                # Map the box back to full-resolution coordinates.
-                x0 = max(int(x / DETECT_SCALE), 0)
-                y0 = max(int(y / DETECT_SCALE), 0)
-                x1 = min(int((x + w) / DETECT_SCALE), frame_w)
-                y1 = min(int((y + h) / DETECT_SCALE), frame_h)
+                x0 = max(
+                    int(x / DETECT_SCALE), 0
+                )
+
+                y0 = max(
+                    int(y / DETECT_SCALE), 0
+                )
+
+                x1 = min(
+                    int((x + w) / DETECT_SCALE),
+                    frame_w
+                )
+
+                y1 = min(
+                    int((y + h) / DETECT_SCALE),
+                    frame_h
+                )
 
                 face = gray_full[y0:y1, x0:x1]
 
@@ -450,68 +749,182 @@ def main():
                     continue
 
                 face = preprocess_face(face)
+
                 label, confidence = recognizer.predict(face)
+
+                # Lower LBPH confidence means a better match.
 
                 if (
                     confidence < FACE_CONFIDENCE_THRESHOLD
                     and label in label_to_name
                 ):
+
                     name = label_to_name[label]
 
-                    # Attendance: once per person per day, retried on error.
+                    # Attendance: once per person per day.
+
                     if (
                         attendance_done.get(name) != today
                         and now >= attendance_retry_at.get(name, 0)
                     ):
+
                         status = mark_attendance(name)
 
                         if status == ATTENDANCE_ERROR:
+
                             attendance_retry_at[name] = (
                                 now + ATTENDANCE_RETRY_SECONDS
                             )
+
                         else:
                             attendance_done[name] = today
 
-                    # Throttled logging.
-                    if now - last_logged.get(name, 0) >= RECOGNIZED_LOG_INTERVAL:
+                    # Throttled recognized-face logging.
+
+                    if (
+                        now - last_logged.get(name, 0)
+                        >= RECOGNIZED_LOG_INTERVAL
+                    ):
+
                         print(
                             f"[RECOGNIZED] {name} "
                             f"(Confidence: {confidence:.2f})"
                         )
+
                         last_logged[name] = now
 
                 else:
-                    unknown_in_frame = True
 
-            # ---- Unknown-face alerting with temporal smoothing ----
+                    unknown_in_frame = True
+                    unknown_confidences.append(confidence)
+
+            # ----------------------------------
+            # UNKNOWN FACE CONFIDENCE LOGGING
+            # ----------------------------------
+
             if unknown_in_frame:
+
+                if now - last_unknown_log >= UNKNOWN_LOG_INTERVAL:
+
+                    best_unknown_confidence = min(
+                        unknown_confidences
+                    )
+
+                    print(
+                        "[UNKNOWN] Face detected. "
+                        f"Confidence: "
+                        f"{best_unknown_confidence:.2f} "
+                        f"(Threshold: "
+                        f"{FACE_CONFIDENCE_THRESHOLD:.2f})"
+                    )
+
+                    last_unknown_log = now
+
+            # ----------------------------------
+            # UNKNOWN VISIT TRACKING
+            # ----------------------------------
+
+            if unknown_in_frame:
+
                 unknown_streak += 1
+                unknown_clear_streak = 0
+
             else:
+
                 unknown_streak = 0
+
+                if unknown_visit_alerted:
+
+                    unknown_clear_streak += 1
+
+                    if (
+                        unknown_clear_streak
+                        >= UNKNOWN_CLEAR_FRAMES_REQUIRED
+                    ):
+
+                        unknown_visit_alerted = False
+                        unknown_clear_streak = 0
+
+                        print(
+                            "[INFO] Previous unknown-person "
+                            "visit ended. Alert system reset."
+                        )
+
+            # ----------------------------------
+            # GLOBAL 10-MINUTE ALERT COOLDOWN
+            # ----------------------------------
 
             if (
                 unknown_streak >= UNKNOWN_FRAMES_REQUIRED
-                and now - last_alert_time >= COOLDOWN_SECONDS
-                and (alert_thread is None or not alert_thread.is_alive())
+                and not unknown_visit_alerted
             ):
-                print("[ALERT] Unauthorized person detected!")
 
-                # Start the cooldown on every attempt (success or failure) so a
-                # broken network or bad password can't cause a retry storm.
-                last_alert_time = now
-                unknown_streak = 0
+                # Mark this visit as alerted even when
+                # the global cooldown prevents an email.
+                unknown_visit_alerted = True
 
-                if email_configured():
-                    alert_thread = start_alert_thread(frame)
+                current_time = time.time()
+
+                if (
+                    current_time - last_alert_time
+                    >= ALERT_COOLDOWN_SECONDS
+                ):
+
+                    print(
+                        "[ALERT] Unauthorized person detected! "
+                        "Sending email alert."
+                    )
+
+                    # Start global cooldown immediately.
+                    last_alert_time = current_time
+
+                    if email_configured():
+
+                        if (
+                            alert_thread is None
+                            or not alert_thread.is_alive()
+                        ):
+
+                            alert_thread = start_alert_thread(frame)
+
+                        else:
+
+                            print(
+                                "[WARNING] Previous email is still "
+                                "being sent. Alert skipped."
+                            )
+
+                    else:
+
+                        print(
+                            "[WARNING] Email unavailable. "
+                            "Alert recorded in application log only."
+                        )
+
+                else:
+
+                    remaining = int(
+                        ALERT_COOLDOWN_SECONDS
+                        - (current_time - last_alert_time)
+                    )
+
+                    print(
+                        "[INFO] Alert suppressed. "
+                        f"Global cooldown active: "
+                        f"{remaining} seconds remaining."
+                    )
 
             time.sleep(0.03)
 
     except KeyboardInterrupt:
+
         print("\n[INFO] Stopping application...")
 
     finally:
+
         if capture is not None:
             capture.release()
+
         print("[INFO] Camera released.")
         print("[INFO] Smart Attendance System stopped.")
 
