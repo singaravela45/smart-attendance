@@ -5,9 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/root/files
+WorkingDirectory=/usr/bin/files
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/python3 /home/root/files/main.py
+ExecStart=/usr/bin/python3 /usr/bin/files/main.py
 Restart=on-failure
 RestartSec=5
 
